@@ -7246,7 +7246,7 @@ bool flowGGUFModelRunner::load_from_gguf(const std::string & encoder_gguf_path,
 void flowGGUFModelRunner::set_num_threads(int n_threads) {
     num_threads_ = n_threads > 0 ? n_threads : 1;
     if (loader_.backend() && !runner_backend_is_device(loader_.backend())) {
-        ggml_backend_cpu_set_n_threads(loader_.backend(), num_threads_);
+        // ggml_backend_cpu_set_n_threads(loader_.backend(), num_threads_);
     }
 }
 void flowGGUFModelRunner::reset_stream() {
