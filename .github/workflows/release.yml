@@ -7,6 +7,11 @@ on:
         description: 'Create new release'
         required: true
         type: boolean
+      force_rebuild:
+        description: 'Force rebuild all platforms (ignore existing assets)'
+        required: false
+        type: boolean
+        default: false
   push:
     branches:
       - master
@@ -22,9 +27,93 @@ env:
 
 jobs:
   # ============================================================
+  # Pre-flight: determine tag and check which assets already exist
+  # ============================================================
+  check-assets:
+    runs-on: ubuntu-latest
+    outputs:
+      tag_name: ${{ steps.tag.outputs.name }}
+      # Each output is "true" if the asset is MISSING (needs build)
+      need_macos_arm64:       ${{ steps.check.outputs.need_macos_arm64 }}
+      need_macos_x64:         ${{ steps.check.outputs.need_macos_x64 }}
+      need_ubuntu_cpu:        ${{ steps.check.outputs.need_ubuntu_cpu }}
+      need_ubuntu_vulkan:     ${{ steps.check.outputs.need_ubuntu_vulkan }}
+      need_ubuntu_cuda:       ${{ steps.check.outputs.need_ubuntu_cuda }}
+      need_win_cpu_x64:       ${{ steps.check.outputs.need_win_cpu_x64 }}
+      need_win_cpu_arm64:     ${{ steps.check.outputs.need_win_cpu_arm64 }}
+      need_win_vulkan:        ${{ steps.check.outputs.need_win_vulkan }}
+      need_win_opencl_adreno: ${{ steps.check.outputs.need_win_opencl_adreno }}
+      need_win_cuda:          ${{ steps.check.outputs.need_win_cuda }}
+      need_win_hip:           ${{ steps.check.outputs.need_win_hip }}
+    steps:
+      - name: Clone
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine tag name
+        id: tag
+        uses: ./.github/actions/get-tag-name
+
+      - name: Check existing release assets
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ github.event.inputs.force_rebuild || 'false' }}
+        run: |
+          TAG="${{ steps.tag.outputs.name }}"
+          echo "Tag: $TAG"
+
+          if [[ "$FORCE" == "true" ]]; then
+            echo "Force rebuild requested — all platforms will build"
+            for key in macos_arm64 macos_x64 ubuntu_cpu ubuntu_vulkan ubuntu_cuda \
+                       win_cpu_x64 win_cpu_arm64 win_vulkan win_opencl_adreno win_cuda win_hip; do
+              echo "need_${key}=true" >> $GITHUB_OUTPUT
+            done
+            exit 0
+          fi
+
+          # Fetch existing asset names for this tag (empty if release doesn't exist)
+          ASSETS=""
+          RELEASE_JSON=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${TAG}" 2>/dev/null || echo "")
+          if [[ -n "$RELEASE_JSON" ]]; then
+            ASSETS=$(echo "$RELEASE_JSON" | jq -r '.assets[].name // empty' 2>/dev/null || echo "")
+          fi
+          echo "Existing assets:"
+          echo "$ASSETS"
+
+          # Helper: output "true" if asset is missing, "false" if present
+          check_asset() {
+            local key="$1"
+            local pattern="$2"
+            if echo "$ASSETS" | grep -q "$pattern"; then
+              echo "need_${key}=false" >> $GITHUB_OUTPUT
+              echo "  SKIP $key ($pattern found)"
+            else
+              echo "need_${key}=true" >> $GITHUB_OUTPUT
+              echo "  BUILD $key ($pattern not found)"
+            fi
+          }
+
+          check_asset macos_arm64       "bin-macos-arm64"
+          check_asset macos_x64         "bin-macos-x64"
+          check_asset ubuntu_cpu        "bin-ubuntu-x64.zip"
+          check_asset ubuntu_vulkan     "bin-ubuntu-vulkan"
+          check_asset ubuntu_cuda       "bin-ubuntu-cuda"
+          check_asset win_cpu_x64       "bin-win-cpu-x64"
+          check_asset win_cpu_arm64     "bin-win-cpu-arm64"
+          check_asset win_vulkan        "bin-win-vulkan"
+          check_asset win_opencl_adreno "bin-win-opencl"
+          check_asset win_cuda          "bin-win-cuda"
+          check_asset win_hip           "bin-win-hip"
+
+  # ============================================================
   # macOS Apple Silicon (Metal GPU)
   # ============================================================
   macOS-arm64:
+    needs: check-assets
+    if: needs.check-assets.outputs.need_macos_arm64 == 'true'
     runs-on: macos-14
 
     steps:
@@ -80,6 +169,8 @@ jobs:
   # macOS Intel (CPU only — Metal disabled on CI runners)
   # ============================================================
   macOS-x64:
+    needs: check-assets
+    if: needs.check-assets.outputs.need_macos_x64 == 'true'
     runs-on: macos-15-intel
 
     steps:
@@ -135,6 +226,8 @@ jobs:
   # Linux x64 CPU
   # ============================================================
   ubuntu-22-cpu:
+    needs: check-assets
+    if: needs.check-assets.outputs.need_ubuntu_cpu == 'true'
     runs-on: ubuntu-22.04
 
     steps:
@@ -188,6 +281,8 @@ jobs:
   # Linux x64 Vulkan (AMD/Intel GPU)
   # ============================================================
   ubuntu-22-vulkan:
+    needs: check-assets
+    if: needs.check-assets.outputs.need_ubuntu_vulkan == 'true'
     runs-on: ubuntu-22.04
 
     steps:
@@ -241,9 +336,11 @@ jobs:
           name: llama-bin-ubuntu-vulkan-x64.zip
 
   # ============================================================
-  # Linux x64 CUDA (NVIDIA GPU) — not in upstream, added for omni
+  # Linux x64 CUDA (NVIDIA GPU)
   # ============================================================
   ubuntu-22-cuda:
+    needs: check-assets
+    if: needs.check-assets.outputs.need_ubuntu_cuda == 'true'
     runs-on: ubuntu-22.04
 
     strategy:
@@ -264,16 +361,17 @@ jobs:
           evict-old-files: 1d
 
       - name: Install CUDA Toolkit
-        uses: Jimver/cuda-toolkit@v0.2.21
-        with:
-          cuda: ${{ matrix.cuda }}.0
-          method: 'network'
-          sub-packages: '["nvcc", "cudart-dev", "cublas-dev"]'
+        run: |
+          wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y cuda-nvcc-12-4 cuda-cudart-dev-12-4 libcublas-dev-12-4
+          echo "/usr/local/cuda-12.4/bin" >> $GITHUB_PATH
+          echo "LD_LIBRARY_PATH=/usr/local/cuda-12.4/lib64:$LD_LIBRARY_PATH" >> $GITHUB_ENV
 
       - name: Dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install build-essential libcurl4-openssl-dev
+          sudo apt-get install -y build-essential libcurl4-openssl-dev
 
       - name: Build
         id: cmake_build
@@ -308,6 +406,9 @@ jobs:
   # Windows x64/arm64 CPU
   # ============================================================
   windows-cpu:
+    needs: check-assets
+    # Run if either x64 or arm64 CPU is needed
+    if: needs.check-assets.outputs.need_win_cpu_x64 == 'true' || needs.check-assets.outputs.need_win_cpu_arm64 == 'true'
     runs-on: windows-2025
 
     strategy:
@@ -374,6 +475,8 @@ jobs:
   # Windows Vulkan + OpenCL (GPU backend DLLs only)
   # ============================================================
   windows:
+    needs: check-assets
+    if: needs.check-assets.outputs.need_win_vulkan == 'true' || needs.check-assets.outputs.need_win_opencl_adreno == 'true'
     runs-on: windows-2025
 
     env:
@@ -459,6 +562,8 @@ jobs:
   # Windows CUDA (NVIDIA GPU backend DLL only)
   # ============================================================
   windows-cuda:
+    needs: check-assets
+    if: needs.check-assets.outputs.need_win_cuda == 'true'
     runs-on: windows-2022
 
     strategy:
@@ -530,6 +635,8 @@ jobs:
   # Windows AMD HIP/ROCm (GPU backend DLL only)
   # ============================================================
   windows-hip:
+    needs: check-assets
+    if: needs.check-assets.outputs.need_win_hip == 'true'
     runs-on: windows-2022
 
     env:
@@ -636,10 +743,11 @@ jobs:
           name: llama-bin-win-hip-${{ matrix.name }}-x64.zip
 
   # ============================================================
-  # Create GitHub Release from all artifacts
+  # Create GitHub Release from all available artifacts
   # ============================================================
   release:
-    if: ${{ ( github.event_name == 'push' && github.ref == 'refs/heads/master' ) || github.event.inputs.create_release == 'true' }}
+    # Run even if some build jobs failed or were skipped — release whatever succeeded
+    if: ${{ !cancelled() && (( github.event_name == 'push' && github.ref == 'refs/heads/master' ) || github.event.inputs.create_release == 'true') }}
 
     permissions:
         contents: write # for creating release
@@ -647,6 +755,7 @@ jobs:
     runs-on: ubuntu-latest
 
     needs:
+      - check-assets
       - windows
       - windows-cpu
       - windows-cuda
@@ -680,6 +789,15 @@ jobs:
         run: |
           mkdir -p release
 
+          # List what we got
+          echo "Downloaded artifacts:"
+          ls -la artifact/ 2>/dev/null || echo "  (no artifacts directory)"
+
+          if [[ ! -d artifact ]] || [[ -z "$(ls artifact/*.zip 2>/dev/null)" ]]; then
+            echo "No artifacts to release!"
+            exit 1
+          fi
+
           echo "Adding CPU backend files to existing zips..."
           for arch in x64 arm64; do
             cpu_zip="artifact/llama-bin-win-cpu-${arch}.zip"
@@ -706,6 +824,7 @@ jobs:
 
           echo "Renaming and moving zips to release..."
           for zip_file in artifact/llama-bin-win-*.zip; do
+            [[ -f "$zip_file" ]] || continue
             base_name=$(basename "$zip_file" .zip)
             zip_name="llama-${{ steps.tag.outputs.name }}-${base_name#llama-}.zip"
             echo "Moving $zip_file to release/$zip_name"
@@ -713,9 +832,15 @@ jobs:
           done
 
           echo "Moving other artifacts..."
-          mv -v artifact/*.zip release
+          for zip_file in artifact/*.zip; do
+            [[ -f "$zip_file" ]] || continue
+            mv -v "$zip_file" release/
+          done
 
-      - name: Create release
+          echo "Final release contents:"
+          ls -la release/
+
+      - name: Create or update release
         id: create_release
         uses: ggml-org/action-create-release@v1
         env:
