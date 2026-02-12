@@ -372,7 +372,11 @@ int main(int argc, char ** argv) {
         for (int i = 0; i < 1200; ++i) {  // 最多等 120 秒
             FILE * f = fopen(done_flag.c_str(), "r");
             if (f) { fclose(f); fprintf(stderr, "Audio generation completed.\n"); break; }
-            usleep(100000);  // 100ms
+#ifdef _WIN32
+            Sleep(100);      // 100ms (Windows)
+#else
+            usleep(100000);  // 100ms (POSIX)
+#endif
         }
     }
 
